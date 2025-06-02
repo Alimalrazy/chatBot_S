@@ -5,6 +5,9 @@ import logging
 from processor import ExcelRAGProcessor
 import time
 import glob
+import requests
+import io
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -102,6 +105,28 @@ def display_header():
     </div>
     """, unsafe_allow_html=True)
 
+def download_google_drive_file(file_id, destination_path):
+    """Downloads a file from Google Drive given its file ID."""
+    URL = "https://drive.google.com/drive/folders/16VPPIJSpRENSUJEbDFcc_q-AUenzuY7_"
+
+    with requests.Session() as session:
+        response = session.get(URL, params = { 'id' : file_id }, stream = True)
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
+
+        if token:
+            params = { 'id' : file_id, 'confirm' : token }
+            response = session.get(URL, params = params, stream = True)
+
+        response.raise_for_status() # Raise an exception for bad status codes
+        with open(destination_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
 def load_excel_files_from_folder():
     """Load Excel file paths from the current directory"""
     excel_files = []
@@ -190,6 +215,64 @@ def display_sidebar():
                 else:
                     st.error(f"❌ {file_data['filename']}: {file_data.get('error', 'Unknown error')}")
         
+        st.divider()
+        
+        # Google Drive Link Input
+        st.header("☁️ Load from Google Drive")
+        # Implementation of Google Drive link input
+        
+        st.divider()
+        
+        # Add File Upload Feature
+        st.header("📤 Upload Excel Files")
+        uploaded_files = st.file_uploader(
+            "Upload your Excel files",
+            type=['xlsx', 'xls', 'csv'],
+            accept_multiple_files=True
+        )
+
+        if uploaded_files:
+            if st.button("Process Uploaded Files", type="primary", key="process_uploaded"):
+                with st.spinner("🔄 Processing uploaded files..."):
+                    try:
+                        # Save uploaded files temporarily
+                        temp_files = []
+                        for uploaded_file in uploaded_files:
+                            temp_path = os.path.join(tempfile.gettempdir(), uploaded_file.name) # Use tempfile to get a proper temp dir
+                            with open(temp_path, "wb") as f:
+                                f.write(uploaded_file.getvalue())
+                            temp_files.append(temp_path)
+                        
+                        # Process the files
+                        start_time = time.time()
+                        results = st.session_state.processor.process_files(temp_files)
+                        processing_time = time.time() - start_time
+                        
+                        st.session_state.results = results
+                        st.session_state.processing_status = {
+                            'success': True,
+                            'time': processing_time,
+                            'file_count': len(results)
+                        }
+                        
+                        # Clean up temporary files
+                        for temp_file in temp_files:
+                            os.remove(temp_file)
+                        
+                        success_count = sum(1 for r in results.values() if r['status'] == 'success')
+                        if success_count > 0:
+                            st.success(f"✅ Successfully processed {success_count}/{len(results)} files in {processing_time:.2f}s!")
+                        else:
+                            st.error("❌ No files were processed successfully")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing files: {e}")
+                        st.error(f"❌ Processing Error: {str(e)}")
+                        st.session_state.processing_status = {
+                            'success': False,
+                            'error': str(e)
+                        }
+
         st.divider()
         
         # Actions section
