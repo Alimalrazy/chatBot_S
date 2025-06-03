@@ -1,3 +1,4 @@
+# processor.py - UPDATED VERSION
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Any, Optional
@@ -18,16 +19,28 @@ class ExcelRAGProcessor:
     def __init__(self, gemini_key: str = None):
         self.processed_files = {}
         self.all_records = []  # Centralized data storage
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
-        )
+        self.embeddings = None  # Initialize as None
         self.vector_store = None
         self.conversation_history = []
         self.gemini_key = gemini_key or os.getenv('GEMINI_API_KEY')
         
         if not self.gemini_key:
             logger.warning("No Gemini API key provided. Query functionality will be limited.")
+    
+    def _initialize_embeddings(self):
+        """Lazy initialization of embeddings to avoid startup errors."""
+        if self.embeddings is None:
+            try:
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2",
+                    model_kwargs={'device': 'cpu'},
+                    encode_kwargs={'normalize_embeddings': True}
+                )
+                logger.info("Embeddings initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize embeddings: {e}")
+                # Fallback: create a simple text-based search
+                self.embeddings = None
     
     def find_header_with_sequential_pattern(self, data: List[List]) -> Optional[int]:
         """
@@ -183,35 +196,46 @@ class ExcelRAGProcessor:
         }
     
     def _build_rag_system(self):
-        """Build RAG system from processed data."""
-        documents = []
-        
-        for record in self.all_records:
-            content_parts = [f"Record from {record['_filename']}:"]
+        """Build RAG system from processed data with error handling."""
+        try:
+            # Initialize embeddings lazily
+            self._initialize_embeddings()
             
-            for key, value in record.items():
-                if not key.startswith('_') and value and str(value).strip():
-                    content_parts.append(f"{key}: {value}")
+            if self.embeddings is None:
+                logger.warning("Embeddings not available, using fallback search")
+                return
             
-            content = "\n".join(content_parts)
+            documents = []
             
-            doc = Document(
-                page_content=content,
-                metadata={
-                    'filename': record['_filename'], 
-                    'file_id': record['_file_id'],
-                    'row_index': record.get('_row_index', 0)
-                }
-            )
-            documents.append(doc)
-        
-        if documents:
-            self.vector_store = Chroma.from_documents(
-                documents=documents,
-                embedding=self.embeddings,
-                persist_directory="./chroma_db"
-            )
-            logger.info(f"Built RAG system with {len(documents)} documents")
+            for record in self.all_records:
+                content_parts = [f"Record from {record['_filename']}:"]
+                
+                for key, value in record.items():
+                    if not key.startswith('_') and value and str(value).strip():
+                        content_parts.append(f"{key}: {value}")
+                
+                content = "\n".join(content_parts)
+                
+                doc = Document(
+                    page_content=content,
+                    metadata={
+                        'filename': record['_filename'], 
+                        'file_id': record['_file_id'],
+                        'row_index': record.get('_row_index', 0)
+                    }
+                )
+                documents.append(doc)
+            
+            if documents:
+                self.vector_store = Chroma.from_documents(
+                    documents=documents,
+                    embedding=self.embeddings,
+                    persist_directory="./chroma_db"
+                )
+                logger.info(f"Built RAG system with {len(documents)} documents")
+        except Exception as e:
+            logger.error(f"Error building RAG system: {e}")
+            self.vector_store = None
     
     def find_exact_record(self, search_id: str, search_name: str = None) -> Dict[str, Any]:
         """Find exact record by ID and optionally name."""
@@ -243,6 +267,31 @@ class ExcelRAGProcessor:
         
         logger.info(f"No record found for ID: {search_id}")
         return None
+    
+    def _simple_text_search(self, question: str, k: int = 3) -> List[str]:
+        """Fallback text search when vector search is not available."""
+        question_lower = question.lower()
+        results = []
+        
+        for record in self.all_records:
+            content_parts = [f"Record from {record['_filename']}:"]
+            match_score = 0
+            
+            for key, value in record.items():
+                if not key.startswith('_') and value and str(value).strip():
+                    value_str = str(value).strip()
+                    content_parts.append(f"{key}: {value_str}")
+                    
+                    # Simple keyword matching
+                    if any(word in value_str.lower() for word in question_lower.split()):
+                        match_score += 1
+            
+            if match_score > 0:
+                results.append((match_score, "\n".join(content_parts)))
+        
+        # Sort by match score and return top k
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [content for _, content in results[:k]]
     
     def query(self, question: str) -> str:
         """Answer user queries with systematic search."""
@@ -324,7 +373,7 @@ class ExcelRAGProcessor:
             else:
                 return f"No record found for ID {search_id}" + (f" with name {search_name}" if search_name else "") + " in the loaded data."
         
-        # If no ID pattern found, use vector search as fallback
+        # If no ID pattern found, use vector search or fallback
         if self.vector_store:
             try:
                 relevant_docs = self.vector_store.similarity_search(question, k=3)
@@ -334,9 +383,20 @@ class ExcelRAGProcessor:
                 else:
                     return "No relevant information found for your query."
             except Exception as e:
-                return f"Search error: {str(e)}"
-        
-        return "Unable to process the query. Please try asking about a specific ID number."
+                logger.error(f"Vector search error: {e}")
+                # Fall back to simple text search
+                results = self._simple_text_search(question)
+                if results:
+                    return f"Based on the data, here's what I found:\n\n{results[0]}"
+                else:
+                    return "No relevant information found for your query."
+        else:
+            # Use simple text search as fallback
+            results = self._simple_text_search(question)
+            if results:
+                return f"Based on the data, here's what I found:\n\n{results[0]}"
+            else:
+                return "No relevant information found for your query."
     
     def get_all_data_summary(self) -> str:
         """Get a summary of all loaded records."""
